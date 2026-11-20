@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1020">
+  <title>AFG AI — Your intelligent workspace</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand"><div class="brand-mark">A</div><div><b>AFG AI</b><small>INTELLIGENCE STUDIO</small></div></div>
+      <button class="new-chat" id="newChat">＋ <span>New conversation</span></button>
+      <div class="nav-label">WORKSPACE</div>
+      <button class="nav active" data-view="chat">◉ <span>AI Chat</span></button>
+      <button class="nav" data-view="image">✧ <span>Image Studio</span></button>
+      <button class="nav" data-view="coding">⌘ <span>Coding assistant</span></button>
+      <button class="nav" data-view="documents">▤ <span>Documents</span></button>
+      <div class="sidebar-bottom"><div class="status-dot"></div><span>AI services ready when configured</span></div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <button class="mobile-menu" id="mobileMenu">☰</button>
+        <div class="crumb">Workspace <span>/</span> <b id="pageName">AI Chat</b></div>
+        <select id="language" aria-label="Language">
+          <option value="en">English</option><option value="fa">فارسی</option><option value="ps">پښتو</option>
+        </select>
+      </header>
+
+      <section class="view active" id="chatView">
+        <div class="welcome">
+          <div class="eyebrow">YOUR AI WORKSPACE</div>
+          <h1>Ideas become<br><span>intelligence.</span></h1>
+          <p>Ask questions, explore ideas, write, translate, and build with AFG AI.</p>
+        </div>
+        <div class="chat-log" id="chatLog"></div>
+        <div class="composer-wrap">
+          <div class="mode-row">
+            <button class="mode active" data-mode="chat">General</button>
+            <button class="mode" data-mode="coding">Coding</button>
+            <button class="mode" data-mode="translator">Translate</button>
+            <button class="mode" data-mode="writer">Writing</button>
+            <button class="mode" data-mode="analysis">Analysis</button>
+          </div>
+          <form id="chatForm" class="composer">
+            <textarea id="message" rows="1" placeholder="Message AFG AI..." required></textarea>
+            <button class="send" type="submit" aria-label="Send">↑</button>
+          </form>
+          <div class="hint">AI can make mistakes. Verify important information.</div>
+        </div>
+      </section>
+
+      <section class="view" id="imageView">
+        <div class="section-head"><div class="eyebrow">CREATIVE WORKSPACE</div><h1>Image <span>Studio</span></h1><p>Create an image from a prompt or upload a photo to edit it.</p></div>
+        <form id="imageForm" class="studio-card">
+          <label class="upload" for="imageFile"><span class="upload-icon">＋</span><b id="uploadTitle">Upload an image to edit (optional)</b><small>PNG, JPG or WEBP · up to 10 MB</small><input id="imageFile" type="file" accept="image/png,image/jpeg,image/webp"></label>
+          <div class="field-label">YOUR INSTRUCTIONS</div>
+          <textarea id="imagePrompt" class="prompt-area" rows="4" placeholder="Describe the image you want, or explain how to edit your uploaded photo..."></textarea>
+          <button class="primary" type="submit" id="imageSubmit">✧ Generate image</button>
+          <p class="hint">Image generation and editing depend on your API model access and available quota.</p>
+        </form>
+        <div id="imageResult" class="image-result"></div>
+      </section>
+
+      <section class="view" id="codingView">
+        <div class="section-head"><div class="eyebrow">DEVELOPER TOOLS</div><h1>Coding <span>Assistant</span></h1><p>Switch to Coding in AI Chat to ask for code, explanations, and debugging help.</p><button class="primary" data-goto="chat">Open AI Chat</button></div>
+      </section>
+      <section class="view" id="documentsView">
+        <div class="section-head"><div class="eyebrow">KNOWLEDGE WORKSPACE</div><h1>Document <span>Tools</span></h1><p>PDF upload and document question-answering are planned for the next release.</p></div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
