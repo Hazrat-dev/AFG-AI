@@ -1,15 +1,17 @@
-"""AFG AI backend - Groq for chat, Google Gemini for image generation/editing."""
+"""AFG AI backend - Groq for chat and Pollinations for image generation."""
+import asyncio
 import logging
 import os
 from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from google import genai
-from google.genai import types
 from groq import Groq
 
 
@@ -20,18 +22,18 @@ logger = logging.getLogger("afg_ai")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
+IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "black-forest-labs/flux.1-schnell")
+IMAGE_API_BASE = "https://gen.pollinations.ai"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 app = FastAPI(
     title="AFG AI",
     version="1.1.0",
-    description="Multilingual AI assistant with Groq chat and Gemini image generation/editing.",
+    description="Multilingual AI assistant with Groq chat and Pollinations image generation.",
 )
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 class ChatRequest(BaseModel):
@@ -55,7 +57,8 @@ def health():
         "status": "ok",
         "chat_configured": groq_client is not None,
         "chat_model": CHAT_MODEL,
-        "image_configured": gemini_client is not None,
+        "image_configured": bool(POLLINATIONS_API_KEY),
+        "image_provider": "pollinations",
         "image_model": IMAGE_MODEL,
     }
 
@@ -97,41 +100,77 @@ async def image(
     prompt: str = Form(..., min_length=1, max_length=4_000),
     image_file: Optional[UploadFile] = File(default=None),
 ):
-    """Generate an image or edit an uploaded image with Gemini."""
-    if gemini_client is None:
-        raise HTTPException(status_code=503, detail="Image service is not configured. Add GEMINI_API_KEY in Render Environment.")
-    prompt = prompt.strip()
-    parts = [types.Part(text=prompt)]
-    if image_file is not None:
-        raw = await image_file.read(MAX_IMAGE_BYTES + 1)
-        if len(raw) > MAX_IMAGE_BYTES:
-            raise HTTPException(status_code=413, detail="Image must be 10 MB or smaller.")
-        mime_type = image_file.content_type or "application/octet-stream"
-        if not mime_type.startswith("image/"):
-            raise HTTPException(status_code=415, detail="Please upload a valid image file.")
-        parts.insert(0, types.Part(inline_data=types.Blob(mime_type=mime_type, data=raw)))
-    try:
-        result = gemini_client.models.generate_content(
-            model=IMAGE_MODEL,
-            contents=[types.Content(role="user", parts=parts)],
-            config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+    """Generate an image with Pollinations. Uploaded-image editing is not enabled in this version."""
+    if not POLLINATIONS_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Image service is not configured. Add POLLINATIONS_API_KEY in Render Environment.",
         )
-        for candidate in result.candidates or []:
-            candidate_content = getattr(candidate, "content", None)
-            for part in getattr(candidate_content, "parts", []) or []:
-                inline_data = getattr(part, "inline_data", None)
-                if inline_data and inline_data.data:
-                    return Response(
-                        content=inline_data.data,
-                        media_type=inline_data.mime_type or "image/png",
-                        headers={"Content-Disposition": 'inline; filename="afg-ai-result.png"'},
-                    )
-        logger.warning("Gemini image model returned no image (model=%s).", IMAGE_MODEL)
-        raise HTTPException(status_code=502, detail="The model returned no image. Try another prompt.")
+    if POLLINATIONS_API_KEY.startswith("pk_"):
+        raise HTTPException(
+            status_code=503,
+            detail="This endpoint needs a secret Pollinations key beginning with sk_, not an app key beginning with pk_. Keep the key private.",
+        )
+    if image_file is not None:
+        raise HTTPException(
+            status_code=501,
+            detail="Text-to-image is enabled. Image editing will be added separately; remove the uploaded image and try a text prompt.",
+        )
+
+    prompt = prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=422, detail="Please enter an image description.")
+
+    query = urlencode({"model": IMAGE_MODEL, "width": 1024, "height": 1024})
+    url = f"{IMAGE_API_BASE}/image/{quote(prompt, safe='')}?{query}"
+    request = Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
+            "Accept": "image/*",
+            "User-Agent": "AFG-AI/1.2",
+        },
+        method="GET",
+    )
+
+    def fetch_image():
+        with urlopen(request, timeout=180) as response:
+            content_type = response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0]
+            body = response.read(MAX_IMAGE_BYTES * 5 + 1)
+            if len(body) > MAX_IMAGE_BYTES * 5:
+                raise ValueError("Generated image is larger than the 50 MB limit.")
+            return body, content_type
+
+    try:
+        body, content_type = await asyncio.to_thread(fetch_image)
+        if not content_type.startswith("image/"):
+            logger.error("Pollinations returned a non-image response: %s", content_type)
+            raise HTTPException(status_code=502, detail="Image provider did not return an image. Check the API key and model permissions.")
+        extension = "png" if "png" in content_type else "webp" if "webp" in content_type else "jpg"
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'inline; filename="afg-ai-result.{extension}"'},
+        )
     except HTTPException:
         raise
+    except HTTPError as exc:
+        error_body = exc.read(2000).decode("utf-8", errors="replace")
+        logger.warning("Pollinations API returned HTTP %s: %s", exc.code, error_body)
+        if exc.code == 401:
+            detail = "Pollinations API key is invalid. Check that POLLINATIONS_API_KEY is a valid secret key beginning with sk_."
+        elif exc.code == 402:
+            detail = "Pollinations account/key has no remaining image-generation budget. Check your account balance and key budget."
+        elif exc.code == 429:
+            detail = "Pollinations rate limit reached. Please wait and try again."
+        else:
+            detail = f"Pollinations image request failed (HTTP {exc.code}). Check Render logs."
+        raise HTTPException(status_code=502, detail=detail) from exc
+    except (URLError, TimeoutError, ValueError) as exc:
+        logger.exception("Pollinations image request failed (model=%s).", IMAGE_MODEL)
+        raise HTTPException(status_code=502, detail="Could not generate the image. Check Render logs and try again.") from exc
     except Exception as exc:
-        logger.exception("Gemini image request failed (model=%s).", IMAGE_MODEL)
+        logger.exception("Unexpected Pollinations image error (model=%s).", IMAGE_MODEL)
         raise HTTPException(status_code=502, detail="Image request failed. Check Render logs.") from exc
 
 
