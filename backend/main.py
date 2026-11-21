@@ -9,7 +9,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, Response
@@ -122,7 +121,8 @@ async def image(
 
     try:
         if image_file is not None:
-            # Image editing: Pollinations OpenAI-compatible multipart endpoint.
+            # Image editing: preserve the uploaded source and request the model's
+            # automatic output dimensions instead of forcing a square crop.
             raw = await image_file.read(MAX_IMAGE_BYTES + 1)
             if len(raw) > MAX_IMAGE_BYTES:
                 raise HTTPException(status_code=413, detail="Image must be 10 MB or smaller.")
@@ -135,7 +135,8 @@ async def image(
             fields = [
                 ("prompt", prompt),
                 ("model", IMAGE_EDIT_MODEL),
-                ("size", "1024x1024"),
+                ("size", "auto"),
+                ("quality", "high"),
                 ("response_format", "b64_json"),
             ]
             chunks = []
@@ -176,7 +177,7 @@ async def image(
 
             body, content_type = await asyncio.to_thread(fetch_edit)
         else:
-            # Text-to-image generation: keep the existing fast generation endpoint.
+            # Text-to-image generation: keep the existing fast generation endpoint unchanged.
             query = urlencode({"model": IMAGE_MODEL, "width": 1024, "height": 1024})
             url = f"{IMAGE_API_BASE}/image/{quote(prompt, safe='')}?{query}"
             request = Request(
