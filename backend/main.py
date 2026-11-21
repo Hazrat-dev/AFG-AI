@@ -1,6 +1,7 @@
 """AFG AI backend - Groq for chat and Pollinations for image generation."""
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "black-forest-labs/flux.1-sc
 IMAGE_EDIT_MODEL = os.getenv("POLLINATIONS_EDIT_MODEL", "black-forest-labs/flux.1-kontext-pro")
 IMAGE_API_BASE = "https://gen.pollinations.ai"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_RESPONSE_BYTES = 50 * 1024 * 1024
 
 
 app = FastAPI(
@@ -98,6 +100,40 @@ def chat(data: ChatRequest):
         raise HTTPException(status_code=502, detail="Chat request failed. Check Render logs for details.") from exc
 
 
+def prepare_edit_output(raw: bytes) -> tuple[bytes, str, str]:
+    """Detect the actual image format and losslessly re-encode edited output as PNG."""
+    if not raw:
+        raise ValueError("The image provider returned an empty image.")
+
+    if len(raw) > MAX_IMAGE_RESPONSE_BYTES:
+        raise ValueError("The edited image is larger than the 50 MB response limit.")
+
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError(
+            "Pillow is required for PNG output. Add 'Pillow' to requirements.txt and redeploy."
+        ) from exc
+
+    try:
+        with Image.open(io.BytesIO(raw)) as source:
+            source.load()
+            # Keep the provider's original pixel dimensions; do not resize or crop.
+            image = source.copy()
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            output = io.BytesIO()
+            image.save(output, format="PNG", optimize=False, compress_level=6)
+            png_data = output.getvalue()
+    except Exception as exc:
+        raise ValueError("The image provider returned data that could not be decoded as an image.") from exc
+
+    if len(png_data) > MAX_IMAGE_RESPONSE_BYTES:
+        raise ValueError("The PNG image is larger than the 50 MB response limit.")
+
+    return png_data, "image/png", "png"
+
+
 @app.post("/api/image")
 async def image(
     prompt: str = Form(..., min_length=1, max_length=4_000),
@@ -121,8 +157,7 @@ async def image(
 
     try:
         if image_file is not None:
-            # Image editing: preserve the uploaded source and request the model's
-            # automatic output dimensions instead of forcing a square crop.
+            # Only the uploaded-image editing path is post-processed.
             raw = await image_file.read(MAX_IMAGE_BYTES + 1)
             if len(raw) > MAX_IMAGE_BYTES:
                 raise HTTPException(status_code=413, detail="Image must be 10 MB or smaller.")
@@ -163,21 +198,28 @@ async def image(
 
             def fetch_edit():
                 with urlopen(edit_request, timeout=240) as response:
-                    payload = json.loads(response.read(MAX_IMAGE_BYTES * 8 + 1).decode("utf-8"))
+                    response_bytes = response.read(MAX_IMAGE_RESPONSE_BYTES * 2 + 1)
+                if len(response_bytes) > MAX_IMAGE_RESPONSE_BYTES * 2:
+                    raise ValueError("Image provider response is too large.")
+                payload = json.loads(response_bytes.decode("utf-8"))
                 item = (payload.get("data") or [{}])[0]
                 encoded = item.get("b64_json")
                 if encoded:
-                    return base64.b64decode(encoded), "image/png"
+                    return base64.b64decode(encoded, validate=True)
                 image_url = item.get("url")
                 if image_url:
                     image_request = Request(image_url, headers={"Accept": "image/*"}, method="GET")
                     with urlopen(image_request, timeout=120) as image_response:
-                        return image_response.read(MAX_IMAGE_BYTES * 5 + 1), image_response.headers.get("Content-Type", "image/png").split(";", 1)[0]
+                        result = image_response.read(MAX_IMAGE_RESPONSE_BYTES + 1)
+                    if len(result) > MAX_IMAGE_RESPONSE_BYTES:
+                        raise ValueError("Edited image is larger than the 50 MB limit.")
+                    return result
                 raise ValueError("Pollinations edit response did not contain an image.")
 
-            body, content_type = await asyncio.to_thread(fetch_edit)
+            raw_result = await asyncio.to_thread(fetch_edit)
+            body, content_type, extension = prepare_edit_output(raw_result)
         else:
-            # Text-to-image generation: keep the existing fast generation endpoint unchanged.
+            # Text-to-image generation remains unchanged.
             query = urlencode({"model": IMAGE_MODEL, "width": 1024, "height": 1024})
             url = f"{IMAGE_API_BASE}/image/{quote(prompt, safe='')}?{query}"
             request = Request(
@@ -193,17 +235,17 @@ async def image(
             def fetch_image():
                 with urlopen(request, timeout=180) as response:
                     content_type = response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0]
-                    body = response.read(MAX_IMAGE_BYTES * 5 + 1)
-                    if len(body) > MAX_IMAGE_BYTES * 5:
+                    body = response.read(MAX_IMAGE_RESPONSE_BYTES + 1)
+                    if len(body) > MAX_IMAGE_RESPONSE_BYTES:
                         raise ValueError("Generated image is larger than the 50 MB limit.")
                     return body, content_type
 
             body, content_type = await asyncio.to_thread(fetch_image)
+            if not content_type.startswith("image/"):
+                logger.error("Pollinations returned a non-image response: %s", content_type)
+                raise HTTPException(status_code=502, detail="Image provider did not return an image. Check the API key and model permissions.")
+            extension = "png" if "png" in content_type else "webp" if "webp" in content_type else "jpg"
 
-        if not content_type.startswith("image/"):
-            logger.error("Pollinations returned a non-image response: %s", content_type)
-            raise HTTPException(status_code=502, detail="Image provider did not return an image. Check the API key and model permissions.")
-        extension = "png" if "png" in content_type else "webp" if "webp" in content_type else "jpg"
         return Response(
             content=body,
             media_type=content_type,
@@ -225,9 +267,9 @@ async def image(
         else:
             detail = f"Pollinations image request failed (HTTP {exc.code}). Check Render logs."
         raise HTTPException(status_code=502, detail=detail) from exc
-    except (URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+    except (URLError, TimeoutError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
         logger.exception("Pollinations image request failed (generate_model=%s, edit_model=%s).", IMAGE_MODEL, IMAGE_EDIT_MODEL)
-        raise HTTPException(status_code=502, detail="Could not process the image. Check Render logs and try again.") from exc
+        raise HTTPException(status_code=502, detail="Could not process the image. Check Render logs and ensure Pillow is installed.") from exc
     except Exception as exc:
         logger.exception("Unexpected Pollinations image error (generate_model=%s, edit_model=%s).", IMAGE_MODEL, IMAGE_EDIT_MODEL)
         raise HTTPException(status_code=502, detail="Image request failed. Check Render logs.") from exc
