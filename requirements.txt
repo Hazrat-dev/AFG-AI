@@ -6,3 +6,4 @@ python-dotenv
 python-multipart
 pydantic
 groq
+Pillow
