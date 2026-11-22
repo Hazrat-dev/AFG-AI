@@ -1,0 +1,28 @@
+AFG AI LOCAL CPU IMAGE EDITOR PATCH
+
+Files:
+- main.py: patched backend (chat and text-to-image preserved; image-upload edit can use local model)
+- local_edit.py: CPU Stable Diffusion img2img engine
+- requirements-local.txt: local model dependencies (append to your existing requirements, do not replace all requirements)
+
+SETUP:
+1. Back up the currently deployed main.py.
+2. Replace the project main.py with this patched main.py.
+3. Copy local_edit.py into the same project root directory as main.py.
+4. Append the packages from requirements-local.txt to your existing requirements.txt (do NOT replace existing requirements).
+5. In Render Environment, set AFG_LOCAL_EDIT=1.
+6. Deploy. First image edit will download model weights from Hugging Face; this is several GB and may exceed Render Free RAM/disk/build limits.
+
+OPTIONAL tuning environment variables:
+AFG_LOCAL_MODEL=stable-diffusion-v1-5/stable-diffusion-v1-5
+AFG_CPU_THREADS=2
+AFG_LOCAL_MAX_SIDE=512
+AFG_LOCAL_STEPS=15
+AFG_LOCAL_STRENGTH=0.55
+AFG_LOCAL_GUIDANCE=7.0
+
+WARNING:
+This patch is real local img2img inference and makes no image-edit API call when AFG_LOCAL_EDIT=1.
+It is NOT verified to fit Render Free. CPU inference may be extremely slow and/or fail due to RAM.
+Pixazo legacy code is kept as fallback when AFG_LOCAL_EDIT is not enabled. To fully disable Pixazo editing,
+keep AFG_LOCAL_EDIT=1 and remove PIXAZO secrets after confirming local mode in Render logs.

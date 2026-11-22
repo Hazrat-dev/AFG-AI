@@ -1,0 +1,8 @@
+# Append these to the existing Render requirements.txt only when enabling local editing.
+Pillow>=10.0
+# CPU build of torch is typically large; install from the CPU index if the host allows it.
+torch>=2.2
+transformers>=4.39
+diffusers>=0.27
+safetensors>=0.4
+accelerate>=0.27
