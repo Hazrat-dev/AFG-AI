@@ -1,4 +1,3 @@
-"""AFG AI backend - Groq chat, Pollinations text-to-image, Pixazo image editing."""
 import asyncio
 import base64
 import io
@@ -32,14 +31,10 @@ PIXAZO_EDIT_URL = os.getenv("PIXAZO_EDIT_URL", "https://gateway.pixazo.ai/gpt-im
 PIXAZO_STATUS_BASE = "https://gateway.pixazo.ai/v2/requests/status/"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_RESPONSE_BYTES = 50 * 1024 * 1024
+AFG_LOCAL_EDIT = os.getenv("AFG_LOCAL_EDIT", "0").strip().lower() in ("1", "true", "yes", "on")
 
-
-app = FastAPI(
-    title="AFG AI", version="1.2.0",
-    description="Multilingual AI assistant with Groq chat, Pollinations text-to-image, and Pixazo image editing.",
-)
+app = FastAPI(title="AFG AI", version="1.3.0", description="Multilingual assistant with Groq chat, Pollinations text-to-image, and configurable local CPU photo editing.")
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=12_000)
@@ -59,13 +54,11 @@ PROMPTS = {
 @app.get("/api/health")
 def health():
     return {
-        "status": "ok",
-        "chat_configured": groq_client is not None,
-        "chat_model": CHAT_MODEL,
-        "image_configured": bool(POLLINATIONS_API_KEY),
-        "image_provider": "pollinations",
-        "image_model": IMAGE_MODEL,
-        "image_edit_provider": "pixazo",
+        "status": "ok", "chat_configured": groq_client is not None,
+        "chat_model": CHAT_MODEL, "image_configured": bool(POLLINATIONS_API_KEY),
+        "image_provider": "pollinations", "image_model": IMAGE_MODEL,
+        "image_edit_provider": "local_cpu" if AFG_LOCAL_EDIT else "pixazo_legacy",
+        "local_edit_enabled": AFG_LOCAL_EDIT,
         "pixazo_edit_configured": bool(PIXAZO_API_KEY),
         "pollinations_edit_model": IMAGE_EDIT_MODEL,
     }
@@ -76,7 +69,7 @@ def chat(data: ChatRequest):
     if groq_client is None:
         raise HTTPException(status_code=503, detail="Chat service is not configured. Add GROQ_API_KEY in Render Environment.")
     system_prompt = PROMPTS.get(data.mode.lower(), PROMPTS["chat"])
-    messages = [{"role": "system", "content": system_prompt + "\nReply in the language used by the user."}]
+    messages = [{"role": "system", "content": system_prompt + "\\nReply in the language used by the user."}]
     for item in data.history[-20:]:
         role = item.get("role")
         if role not in ("user", "assistant"):
@@ -98,33 +91,31 @@ def chat(data: ChatRequest):
 
 
 def prepare_edit_output(raw: bytes) -> tuple[bytes, str, str]:
-    """Decode image and re-encode as PNG without resizing/cropping."""
     if not raw:
-        raise ValueError("The image provider returned an empty image.")
+        raise ValueError("The image editor returned an empty image.")
     if len(raw) > MAX_IMAGE_RESPONSE_BYTES:
-        raise ValueError("The edited image is larger than the 50 MB response limit.")
+        raise ValueError("Edited image exceeds 50 MB response limit.")
     try:
         from PIL import Image
     except ImportError as exc:
-        raise RuntimeError("Pillow is required for PNG output. Add 'Pillow' to requirements.txt and redeploy.") from exc
+        raise RuntimeError("Pillow is required. Add Pillow to requirements.txt.") from exc
     try:
         with Image.open(io.BytesIO(raw)) as source:
             source.load()
             image = source.copy()
             if image.mode not in ("RGB", "RGBA"):
                 image = image.convert("RGBA" if "transparency" in image.info else "RGB")
-            output = io.BytesIO()
-            image.save(output, format="PNG", optimize=False, compress_level=6)
-            png_data = output.getvalue()
+            out = io.BytesIO()
+            image.save(out, format="PNG", optimize=False, compress_level=6)
+            data = out.getvalue()
     except Exception as exc:
-        raise ValueError("The image provider returned data that could not be decoded as an image.") from exc
-    if len(png_data) > MAX_IMAGE_RESPONSE_BYTES:
-        raise ValueError("The PNG image is larger than the 50 MB response limit.")
-    return png_data, "image/png", "png"
+        raise ValueError("Editor output is not a decodable image.") from exc
+    if len(data) > MAX_IMAGE_RESPONSE_BYTES:
+        raise ValueError("PNG exceeds 50 MB response limit.")
+    return data, "image/png", "png"
 
 
 def _pixazo_find_image(obj):
-    """Extract an image URL or base64 payload from common Pixazo response shapes."""
     if isinstance(obj, dict):
         for key in ("b64_json", "image_base64", "base64", "image_b64"):
             value = obj.get(key)
@@ -155,28 +146,20 @@ def _download_pixazo_image(url: str) -> bytes:
     with urlopen(req, timeout=120) as resp:
         data = resp.read(MAX_IMAGE_RESPONSE_BYTES + 1)
     if len(data) > MAX_IMAGE_RESPONSE_BYTES:
-        raise ValueError("Pixazo image output exceeded 50 MB.")
+        raise ValueError("Pixazo output exceeded 50 MB.")
     return data
 
 
 
 def _pixazo_edit_image(raw: bytes, mime_type: str, prompt: str) -> bytes:
-    """Submit a base64 data-URI image edit to Pixazo and poll its async job."""
     if not PIXAZO_API_KEY:
-        raise RuntimeError("Pixazo is not configured. Add PIXAZO_API_KEY in Render Environment.")
+        raise RuntimeError("Pixazo is not configured. Set PIXAZO_API_KEY.")
     data_uri = f"data:{mime_type};base64,{base64.b64encode(raw).decode('ascii')}"
     payload = json.dumps({"prompt": prompt, "image": [data_uri], "size": "2048x2048", "quality": "high", "format": "png"}).encode()
-    headers = {
-        "Ocp-Apim-Subscription-Key": PIXAZO_API_KEY,
-        "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
-        "Accept": "application/json",
-        "User-Agent": "AFG-AI/1.4",
-    }
+    headers = {"Ocp-Apim-Subscription-Key": PIXAZO_API_KEY, "Content-Type": "application/json", "Cache-Control": "no-cache", "Accept": "application/json", "User-Agent": "AFG-AI/1.4"}
     req = Request(PIXAZO_EDIT_URL, data=payload, headers=headers, method="POST")
     with urlopen(req, timeout=180) as resp:
         response_payload = json.loads(resp.read(2 * 1024 * 1024).decode("utf-8"))
-    # Some endpoints return the image immediately; others return an async request ID/polling URL.
     image = _pixazo_find_image(response_payload)
     if isinstance(image, bytes):
         return image
@@ -187,7 +170,7 @@ def _pixazo_edit_image(raw: bytes, mime_type: str, prompt: str) -> bytes:
     if not poll_url and request_id:
         poll_url = PIXAZO_STATUS_BASE + quote(str(request_id), safe="")
     if not poll_url:
-        raise ValueError("Pixazo response contained no image or polling URL: " + json.dumps(response_payload)[:1500])
+        raise ValueError("Pixazo response contained no image or polling URL.")
     deadline = time.monotonic() + 240
     while time.monotonic() < deadline:
         poll_req = Request(poll_url, headers={"Ocp-Apim-Subscription-Key": PIXAZO_API_KEY, "Accept": "application/json", "User-Agent": "AFG-AI/1.4"})
@@ -196,10 +179,7 @@ def _pixazo_edit_image(raw: bytes, mime_type: str, prompt: str) -> bytes:
             ctype = poll_resp.headers.get("Content-Type", "application/json").split(";", 1)[0]
             if ctype.startswith("image/"):
                 return poll_data
-        try:
-            status_payload = json.loads(poll_data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise ValueError("Pixazo status endpoint returned an unrecognized response.")
+        status_payload = json.loads(poll_data.decode("utf-8"))
         image = _pixazo_find_image(status_payload)
         if isinstance(image, bytes):
             return image
@@ -207,14 +187,14 @@ def _pixazo_edit_image(raw: bytes, mime_type: str, prompt: str) -> bytes:
             return _download_pixazo_image(image)
         status = str(status_payload.get("status", status_payload.get("state", ""))).lower()
         if status in ("failed", "failure", "error", "cancelled", "canceled"):
-            raise RuntimeError("Pixazo image-edit job failed: " + json.dumps(status_payload)[:1000])
+            raise RuntimeError("Pixazo image-edit job failed.")
         time.sleep(3)
-    raise TimeoutError("Pixazo image editing timed out after 4 minutes.")
+    raise TimeoutError("Pixazo edit timed out after 4 minutes.")
 
 
 @app.post("/api/image")
 async def image(prompt: str = Form(..., min_length=1, max_length=4000), image_file: Optional[UploadFile] = File(default=None)):
-    """Text prompts use Pollinations. Uploaded photos are edited with Pixazo."""
+    """Text-only generation uses Pollinations; image upload edits locally when AFG_LOCAL_EDIT=1."""
     prompt = prompt.strip()
     if not prompt:
         raise HTTPException(status_code=422, detail="Please enter an image description or editing instruction.")
@@ -226,15 +206,22 @@ async def image(prompt: str = Form(..., min_length=1, max_length=4000), image_fi
             mime_type = image_file.content_type or "application/octet-stream"
             if mime_type not in ("image/jpeg", "image/png", "image/webp"):
                 raise HTTPException(status_code=415, detail="Upload a JPEG, PNG, or WebP image.")
-            if not PIXAZO_API_KEY:
-                raise HTTPException(status_code=503, detail="Photo editing is not configured. Add PIXAZO_API_KEY in Render Environment.")
-            edited = await asyncio.to_thread(_pixazo_edit_image, raw, mime_type, prompt)
+            if AFG_LOCAL_EDIT:
+                try:
+                    from local_edit import edit_image_local
+                except ImportError as exc:
+                    raise HTTPException(status_code=503, detail="Local editor module local_edit.py is missing from deployment.") from exc
+                edited = await asyncio.to_thread(edit_image_local, raw, prompt)
+            else:
+                if not PIXAZO_API_KEY:
+                    raise HTTPException(status_code=503, detail="Set AFG_LOCAL_EDIT=1 to use local CPU editing, or configure Pixazo legacy fallback.")
+                edited = await asyncio.to_thread(_pixazo_edit_image, raw, mime_type, prompt)
             body, content_type, extension = prepare_edit_output(edited)
         else:
             if not POLLINATIONS_API_KEY:
-                raise HTTPException(status_code=503, detail="Image generation is not configured. Add POLLINATIONS_API_KEY in Render Environment.")
+                raise HTTPException(status_code=503, detail="Image generation is not configured. Set POLLINATIONS_API_KEY.")
             if POLLINATIONS_API_KEY.startswith("pk_"):
-                raise HTTPException(status_code=503, detail="Use a secret Pollinations API key beginning with sk_. Keep the key private.")
+                raise HTTPException(status_code=503, detail="Use a secret Pollinations key beginning with sk_.")
             query = urlencode({"model": IMAGE_MODEL, "width": 1024, "height": 1024})
             url = f"{IMAGE_API_BASE}/image/{quote(prompt, safe='')}?{query}"
             request = Request(url, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}", "Accept": "image/*", "User-Agent": "AFG-AI/1.4"}, method="GET")
@@ -243,11 +230,11 @@ async def image(prompt: str = Form(..., min_length=1, max_length=4000), image_fi
                     ctype = response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0]
                     result = response.read(MAX_IMAGE_RESPONSE_BYTES + 1)
                 if len(result) > MAX_IMAGE_RESPONSE_BYTES:
-                    raise ValueError("Generated image is larger than the 50 MB limit.")
+                    raise ValueError("Generated image exceeds 50 MB.")
                 return result, ctype
             body, content_type = await asyncio.to_thread(fetch_image)
             if not content_type.startswith("image/"):
-                raise HTTPException(status_code=502, detail="Pollinations did not return an image. Check key/model permissions.")
+                raise HTTPException(status_code=502, detail="Pollinations did not return an image.")
             extension = "png" if "png" in content_type else "webp" if "webp" in content_type else "jpg"
         return Response(content=body, media_type=content_type, headers={"Content-Disposition": f'inline; filename="afg-ai-result.{extension}"'})
     except HTTPException:
@@ -255,24 +242,14 @@ async def image(prompt: str = Form(..., min_length=1, max_length=4000), image_fi
     except HTTPError as exc:
         error_body = exc.read(2000).decode("utf-8", errors="replace")
         logger.warning("Image API returned HTTP %s: %s", exc.code, error_body)
-        if image_file is not None:
-            if exc.code in (401, 403):
-                detail = "Pixazo API key is invalid or has no access to this model. Check PIXAZO_API_KEY and model permissions."
-            elif exc.code == 429:
-                detail = "Pixazo rate limit reached. Wait and try again."
-            elif exc.code == 400:
-                detail = "Pixazo rejected the edit request or input image. Check Render logs."
-            else:
-                detail = f"Pixazo image-edit request failed (HTTP {exc.code}). Check Render logs."
-        else:
-            detail = f"Pollinations image generation failed (HTTP {exc.code}). Check Render logs."
+        detail = "Image provider request failed. Check Render logs."
         raise HTTPException(status_code=502, detail=detail) from exc
     except (URLError, TimeoutError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
-        provider = "Pixazo" if image_file is not None else "Pollinations"
+        provider = "Local CPU editor" if (image_file is not None and AFG_LOCAL_EDIT) else ("Pixazo" if image_file is not None else "Pollinations")
         logger.exception("%s image request failed.", provider)
-        raise HTTPException(status_code=502, detail=f"{provider} could not process the image. Check Render logs and try again.") from exc
+        raise HTTPException(status_code=502, detail=f"{provider} could not process the image. Check Render logs.") from exc
     except Exception as exc:
-        provider = "Pixazo" if image_file is not None else "Pollinations"
+        provider = "Local CPU editor" if (image_file is not None and AFG_LOCAL_EDIT) else ("Pixazo" if image_file is not None else "Pollinations")
         logger.exception("Unexpected %s image error.", provider)
         raise HTTPException(status_code=502, detail="Image request failed. Check Render logs.") from exc
 
@@ -281,11 +258,9 @@ async def image(prompt: str = Form(..., min_length=1, max_length=4000), image_fi
 def index():
     return FileResponse("frontend/index.html")
 
-
 @app.get("/style.css")
 def css():
     return FileResponse("frontend/style.css", media_type="text/css")
-
 @app.get("/app.js")
 def js():
     return FileResponse("frontend/app.js", media_type="application/javascript")
